@@ -1,72 +1,63 @@
 <#
 .SYNOPSIS
-    Busca informações de usuários no AD e compara seus departamentos principais.
-    Opera em dois modos:
-    1. Comparando pares específicos de um arquivo TXT.
-    2. Comparando todos os pares possíveis de uma lista de usuários fornecida manualmente.
+    Lê pares de usuários de um arquivo TXT ou uma lista manual, busca suas informações no AD,
+    compara o departamento principal e, para o Modo Arquivo, mostra a idade da senha do segundo usuário do par.
 
 .DESCRIPTION
-    Este script consulta o Active Directory para encontrar usuários e comparar seus "departamentos principais"
-    (a primeira parte do nome do departamento).
+    Este script opera em dois modos para consultar o Active Directory, encontrar usuários e comparar
+    seus "departamentos principais" (a primeira parte do nome do departamento).
 
     Modo Arquivo (-FilePath):
     Processa um arquivo TXT onde cada linha deve conter dois nomes de logon de usuário,
-    separados por vírgula (ex: "usuarioA,usuarioB"). Para cada par lido do arquivo,
-    busca as informações de ambos e compara seus departamentos principais.
+    separados por vírgula (ex: "usuarioA,usuarioB"). Para cada par:
+    1. Busca as informações de ambos os usuários.
+    2. Para o SEGUNDO usuário do par, exibe há quanto tempo sua senha foi alterada.
+    3. Compara os departamentos principais dos dois e informa se são iguais ou diferentes.
 
-    Modo Manual (-UserLogonName):
-    Recebe uma lista de um ou mais nomes de logon. Busca as informações de todos os usuários
-    fornecidos e, em seguida, realiza uma comparação individual entre cada par único possível
-    formado a partir dessa lista, verificando se pertencem ao mesmo departamento principal.
+    Modo Manual/Lista (-UserLogonName):
+    Recebe uma lista de um ou mais nomes de logon. Busca as informações de todos e apresenta
+    um sumário final agrupando usuários por departamento principal. (A idade da senha é
+    coletada e pode ser exibida se o bloco de Write-Host for descomentado).
 
 .NOTES
     Autor: Seu Nome/Empresa
     Data: 26/05/2025
     Requerimentos:
         - Módulo Active Directory para PowerShell (RSAT-AD-PowerShell).
-        - Permissões para ler objetos de usuário no AD.
+        - Permissões para ler objetos de usuário no AD (incluindo pwdLastSet).
     Formato do Arquivo TXT (para -FilePath):
         usuario1_linha1,usuario2_linha1
         usuarioA_linha2,usuarioB_linha2
 
 .PARAMETER FilePath
-    (Modo Arquivo) Caminho para um arquivo TXT contendo um par de nomes de logon por linha, separados por vírgula.
+    (Modo Arquivo) Caminho para um arquivo TXT com pares "usuario1,usuario2" por linha.
 
 .PARAMETER UserLogonName
-    (Modo Manual) Um ou mais nomes de logon para realizar comparação de todos os pares possíveis (N x N). Separe por vírgula.
+    (Modo Manual/Lista) Um ou mais nomes de logon.
 
 .PARAMETER SearchBase
-    Opcional. DN da OU para restringir a pesquisa de todos os usuários (aplicável a ambos os modos).
+    Opcional. DN da OU para restringir a pesquisa.
 
 .EXAMPLE
-    # MODO ARQUIVO: Compara pares definidos no arquivo
-    # Supondo que C:\temp\pares.txt contenha: "jorge.s,ana.p" e "maria.c,luis.o"
-    .\Compare-ADUserDeptsAdvanced.ps1 -FilePath "C:\temp\pares.txt"
+    # MODO ARQUIVO: Compara pares e mostra idade da senha do segundo usuário
+    # Supondo que C:\temp\pares.txt contenha: "jorge.s,ana.p"
+    .\Compare-ADUserDeptsWithPwdAge.ps1 -FilePath "C:\temp\pares.txt"
 
 .EXAMPLE
-    # MODO MANUAL: Compara todos os pares da lista fornecida
-    .\Compare-ADUserDeptsAdvanced.ps1 -UserLogonName "userA", "userB", "userC"
-    # (Compara A-B, A-C, B-C)
-
-.EXAMPLE
-    # MODO MANUAL com SearchBase
-    .\Compare-ADUserDeptsAdvanced.ps1 -UserLogonName "userX", "userY" -SearchBase "OU=TI,DC=empresa,DC=com"
+    # MODO MANUAL: Busca usuários e apresenta sumário por departamento
+    .\Compare-ADUserDeptsWithPwdAge.ps1 -UserLogonName "userA", "userB", "userC"
 #>
-[CmdletBinding(DefaultParameterSetName = "ByLogonNames")] # Define o modo manual como padrão se nenhum parâmetro obrigatório de conjunto for usado
+[CmdletBinding(DefaultParameterSetName = "ByLogonNames")]
 param(
-    [Parameter(Mandatory = $true,
-               ParameterSetName = "ByLogonNames",
-               ValueFromPipeline = $true,
-               HelpMessage = "Um ou mais nomes de logon para realizar comparação de todos os pares possíveis (N x N). Separe múltiplos nomes por vírgula.")]
+    [Parameter(Mandatory = $true, ParameterSetName = "ByLogonNames", ValueFromPipeline = $true,
+               HelpMessage = "Um ou mais nomes de logon. A saída será um sumário agrupado por departamento principal.")]
     [string[]]$UserLogonName,
 
-    [Parameter(Mandatory = $true,
-               ParameterSetName = "ByFile",
-               HelpMessage = "Caminho para um arquivo TXT contendo um par de nomes de logon (usuario1,usuario2) por linha para comparação direta.")]
+    [Parameter(Mandatory = $true, ParameterSetName = "ByFile",
+               HelpMessage = "Caminho para um arquivo TXT contendo um par de nomes de logon (usuario1,usuario2) por linha.")]
     [string]$FilePath,
 
-    [Parameter(Mandatory = $false, 
-               HelpMessage = "Opcional. DN da OU para restringir a pesquisa de todos os usuários (aplicável a ambos os modos).")]
+    [Parameter(Mandatory = $false, HelpMessage = "Opcional. DN da OU para restringir a pesquisa (aplicável a ambos os modos).")]
     [string]$SearchBase
 )
 
@@ -76,32 +67,26 @@ function Get-ProcessedUserInfo {
     param(
         [Parameter(Mandatory = $true)]
         [string]$LogonNameInput,
-
         [Parameter(Mandatory = $false)]
         [string]$SearchBaseForUser
     )
-
     $trimmedLogonName = $LogonNameInput.Trim()
-    # Removido o Write-Host daqui para não poluir a saída ao buscar múltiplos usuários para a lista NxN
-    # Ele será chamado explicitamente no modo ByFile ou antes da comparação NxN
-
     $getUserParams = @{
         Identity   = $trimmedLogonName
-        Properties = 'DisplayName', 'Department', 'SamAccountName'
+        Properties = 'DisplayName', 'Department', 'SamAccountName', 'pwdLastSet' # Adicionado pwdLastSet
     }
-
     if (-not [string]::IsNullOrWhiteSpace($SearchBaseForUser)) {
         $getUserParams.SearchBase = $SearchBaseForUser
     }
 
     $userData = [PSCustomObject]@{
-        InputProvided   = $LogonNameInput
-        SamAccountName  = $null
-        DisplayName     = $null
-        FullDepartment  = "N/A"
-        MainDepartment  = "N/A"
-        Found           = $false
-        ErrorMessage    = $null
+        InputProvided           = $LogonNameInput
+        SamAccountName          = $null; DisplayName = $null
+        FullDepartment          = "N/A"; MainDepartment = "N/A"
+        Found                   = $false; ErrorMessage = $null
+        PasswordLastSetDate     = $null # Data da última alteração de senha (DateTime)
+        PasswordLastSetDisplay  = "N/A" # String formatada da data
+        PasswordAgeDisplay      = "N/A" # String formatada da idade da senha (ex: "X dias atrás")
     }
 
     try {
@@ -119,152 +104,167 @@ function Get-ProcessedUserInfo {
                 $userData.FullDepartment = $fullDepartmentFromAD
                 $userData.MainDepartment = ($fullDepartmentFromAD.Split(' ', 2)[0])
             }
+
+            # Processar pwdLastSet
+            if ($adUser.pwdLastSet -eq 0) {
+                $userData.PasswordLastSetDisplay = "Usuário deve alterar senha no próximo logon"
+            } elseif ($adUser.pwdLastSet -gt 0) { # Um valor FILETIME válido deve ser positivo
+                try {
+                    $pwdSetDateTimeUtc = [datetime]::FromFileTimeUtc($adUser.pwdLastSet)
+                    $userData.PasswordLastSetDate = $pwdSetDateTimeUtc # Armazena como DateTime UTC
+                    $userData.PasswordLastSetDisplay = $pwdSetDateTimeUtc.ToLocalTime().ToString("dd/MM/yyyy HH:mm:ss")
+                    
+                    $age = (Get-Date).ToUniversalTime() - $pwdSetDateTimeUtc # Compara em UTC para consistência, depois pega os dias
+                    if ($age.TotalDays -ge 0) {
+                        $userData.PasswordAgeDisplay = "$($age.Days) dia(s) atrás"
+                    } else {
+                        $userData.PasswordAgeDisplay = "Data no futuro?" # Improvável para pwdLastSet
+                    }
+                } catch {
+                    $userData.PasswordLastSetDisplay = "Data de senha inválida (valor bruto: $($adUser.pwdLastSet))"
+                    $userData.PasswordAgeDisplay = "Erro na conversão"
+                }
+            } else { # Inclui nulo, -1 (pode ser 'never expires' com flag UAC) ou outros.
+                $userData.PasswordLastSetDisplay = "Senha não definida para expirar ou configuração especial (valor bruto: $($adUser.pwdLastSet))"
+            }
         }
-    }
-    catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+    } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
         $userData.ErrorMessage = "Usuário '$trimmedLogonName' não encontrado."
-    }
-    catch {
+    } catch {
         $userData.ErrorMessage = "Erro ao buscar '$trimmedLogonName': $($_.Exception.Message)"
     }
     return $userData
 }
 # --- FIM DA FUNÇÃO AUXILIAR ---
 
-# Importar o módulo do Active Directory
 if (-not (Get-Module ActiveDirectory)) {
-    try {
-        Import-Module ActiveDirectory -ErrorAction Stop
-        Write-Host "Módulo ActiveDirectory importado com sucesso." -ForegroundColor Green
-    }
-    catch {
-        Write-Error "Falha ao importar o módulo ActiveDirectory. RSAT para AD DS deve estar instalado."
-        exit 1
-    }
+    try { Import-Module ActiveDirectory -ErrorAction Stop; Write-Host "Módulo ActiveDirectory importado." -FG Green }
+    catch { Write-Error "Falha ao importar módulo ActiveDirectory."; exit 1 }
 }
 
-# Lógica principal baseada no conjunto de parâmetros
+$overallFoundUsersInfo = @{} 
+
 if ($PSCmdlet.ParameterSetName -eq "ByFile") {
-    # MODO ARQUIVO: Processar pares de um arquivo TXT
     if (-not (Test-Path -Path $FilePath -PathType Leaf)) {
-        Write-Error "Arquivo de entrada não encontrado em '$FilePath'."
+        Write-Error "Arquivo não encontrado: '$FilePath'."
         exit 1
     }
-
-    Write-Host "MODO ARQUIVO: Processando arquivo de pares: '$FilePath'" -ForegroundColor Cyan
+    Write-Host "MODO ARQUIVO: Processando '$FilePath'" -FG Cyan
     $linesFromFile = Get-Content -Path $FilePath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-
     if ($linesFromFile.Count -eq 0) {
-        Write-Warning "O arquivo '$FilePath' está vazio ou não contém linhas válidas para processamento."
-        exit 1
+        Write-Warning "Arquivo '$FilePath' vazio ou sem linhas válidas."; exit 1
     }
     Write-Host "Total de pares (linhas) a processar: $($linesFromFile.Count)"
 
     foreach ($line in $linesFromFile) {
         Write-Host "`n=================================================="
-        Write-Host "Processando linha do arquivo: '$line'" -ForegroundColor Yellow
-
+        Write-Host "Processando linha: '$line'" -FG Yellow
         $userPairStrings = $line.Split(',')
         if ($userPairStrings.Count -ne 2) {
-            Write-Warning "Linha '$line' não está no formato esperado 'usuario1,usuario2'. Pulando esta linha."
-            continue
+            Write-Warning "Linha '$line' formato inválido. Pulando."; continue
         }
-
         $userInput1 = $userPairStrings[0].Trim()
         $userInput2 = $userPairStrings[1].Trim()
-
         if ([string]::IsNullOrWhiteSpace($userInput1) -or [string]::IsNullOrWhiteSpace($userInput2)) {
-            Write-Warning "Linha '$line' contém um nome de usuário vazio. Pulando esta linha."
-            continue
+            Write-Warning "Linha '$line' nome de usuário vazio. Pulando."; continue
         }
-        Write-Host "Par a comparar: [$userInput1] e [$userInput2]"
+        Write-Host "Par: [$userInput1] e [$userInput2]"
 
+        Write-Host "  Buscando usuário 1: '$userInput1'..." -FG DarkGray
         $userInfo1 = Get-ProcessedUserInfo -LogonNameInput $userInput1 -SearchBaseForUser $SearchBase
-        if (-not $userInfo1.Found) { Write-Warning $userInfo1.ErrorMessage } else {
-             Write-Host "  Detalhes Usuário 1 ($($userInput1)): $($userInfo1.SamAccountName), Depto Principal '$($userInfo1.MainDepartment)' (Completo: '$($userInfo1.FullDepartment)')"
-        }
+        if ($userInfo1.Found) {
+            Write-Host "    -> Encontrado: $($userInfo1.SamAccountName), Depto Principal: $($userInfo1.MainDepartment) (Completo: '$($userInfo1.FullDepartment)')" -FG DarkCyan
+            if (-not $overallFoundUsersInfo.ContainsKey($userInfo1.SamAccountName)) { $overallFoundUsersInfo[$userInfo1.SamAccountName] = $userInfo1 }
+        } else { Write-Warning $userInfo1.ErrorMessage }
         
+        Write-Host "  Buscando usuário 2: '$userInput2'..." -FG DarkGray
         $userInfo2 = Get-ProcessedUserInfo -LogonNameInput $userInput2 -SearchBaseForUser $SearchBase
-        if (-not $userInfo2.Found) { Write-Warning $userInfo2.ErrorMessage } else {
-            Write-Host "  Detalhes Usuário 2 ($($userInput2)): $($userInfo2.SamAccountName), Depto Principal '$($userInfo2.MainDepartment)' (Completo: '$($userInfo2.FullDepartment)')"
+        if ($userInfo2.Found) {
+            Write-Host "    -> Encontrado: $($userInfo2.SamAccountName), Depto Principal: $($userInfo2.MainDepartment) (Completo: '$($userInfo2.FullDepartment)')" -FG DarkCyan
+            
+            # --- INÍCIO DAS LINHAS DE DEPURAÇÃO ---
+            Write-Host "    DEBUG (Usuário 2): PwdLastSetDisplay: '$($userInfo2.PasswordLastSetDisplay)'" -ForegroundColor Magenta
+            Write-Host "    DEBUG (Usuário 2): PwdAgeDisplay    : '$($userInfo2.PasswordAgeDisplay)'" -ForegroundColor Magenta
+            Write-Host "    DEBUG (Usuário 2): PwdLastSetDate (UTC): '$($userInfo2.PasswordLastSetDate)'" -ForegroundColor Magenta # Mostra a data UTC armazenada
+            # --- FIM DAS LINHAS DE DEPURAÇÃO ---
+
+            Write-Host "       Última alteração de senha (para $($userInfo2.SamAccountName)): $($userInfo2.PasswordLastSetDisplay) - $($userInfo2.PasswordAgeDisplay)" -ForegroundColor Blue 
+            if (-not $overallFoundUsersInfo.ContainsKey($userInfo2.SamAccountName)) { $overallFoundUsersInfo[$userInfo2.SamAccountName] = $userInfo2 }
+        } else { 
+            Write-Warning $userInfo2.ErrorMessage 
         }
 
         if ($userInfo1.Found -and $userInfo2.Found) {
-            $comparisonMessage = ""
-            $comparisonColor = "White"
+            $comparisonMessage = ""; $comparisonColor = "White"
             if ($userInfo1.MainDepartment -eq $userInfo2.MainDepartment) {
-                $comparisonMessage = "PERTENCEM ao MESMO departamento principal ('$($userInfo1.MainDepartment)')"
-                $comparisonColor = "Green"
+                $comparisonMessage = "PERTENCEM ao MESMO departamento principal ('$($userInfo1.MainDepartment)')"; $comparisonColor = "Green"
             } else {
-                $comparisonMessage = "NÃO PERTENCEM ao mesmo departamento principal ('$($userInfo1.MainDepartment)' vs '$($userInfo2.MainDepartment)')"
-                $comparisonColor = "Red"
+                $comparisonMessage = "NÃO PERTENCEM ao mesmo departamento principal ('$($userInfo1.MainDepartment)' vs '$($userInfo2.MainDepartment)')"; $comparisonColor = "Red"
             }
-            Write-Host "  RESULTADO PARA O PAR: $comparisonMessage" -ForegroundColor $comparisonColor
+            Write-Host "  RESULTADO PARA O PAR: $comparisonMessage" -FG $comparisonColor
         } else {
-            Write-Warning "Não foi possível realizar a comparação para o par da linha '$line', pois um ou ambos os usuários não foram encontrados/processados corretamente."
+            Write-Warning "Comparação não realizada para o par da linha '$line' (um ou ambos não encontrados)."
         }
     }
     Write-Host "`n=================================================="
-    Write-Host "Processamento do arquivo de pares concluído." -ForegroundColor Green
+    Write-Host "Processamento do arquivo de pares concluído." -FG Green
 
 }
 elseif ($PSCmdlet.ParameterSetName -eq "ByLogonNames") {
-    # MODO MANUAL: Processar lista de usuários e comparar todos os pares (N x N)
     $logonNamesToProcess = $UserLogonName | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    if ($logonNamesToProcess.Count -eq 0) {
-        Write-Warning "Nenhum nome de usuário válido fornecido para processamento."
-        exit 1
-    }
+    if ($logonNamesToProcess.Count -eq 0) { Write-Warning "Nenhum nome de usuário válido fornecido."; exit 1 }
     
-    Write-Host "MODO MANUAL: Coletando informações dos usuários fornecidos..." -ForegroundColor Cyan
-    $foundUsersListForPairwise = @()
+    Write-Host "MODO MANUAL/LISTA: Coletando informações dos usuários..." -FG Cyan
     foreach ($logonNameInput in $logonNamesToProcess) {
         Write-Host "`n--------------------------------------------------"
-        Write-Host "Processando entrada: '$logonNameInput'" -ForegroundColor Yellow
-         if ($PSBoundParameters.ContainsKey('SearchBase')) {
-            Write-Host "Pesquisando na OU: $SearchBase..." -ForegroundColor Cyan
-        }
+        Write-Host "Processando entrada: '$logonNameInput'" -FG Yellow
+        if ($PSBoundParameters.ContainsKey('SearchBase')) { Write-Host "Pesquisando na OU: $SearchBase..." -FG Cyan }
+        
+        Write-Host "  Buscando detalhes para: '$($logonNameInput.Trim())'..." -FG DarkGray
         $userInfo = Get-ProcessedUserInfo -LogonNameInput $logonNameInput -SearchBaseForUser $SearchBase
         
         if ($userInfo.Found) {
-            Write-Host "  -> Usuário Encontrado: $($userInfo.SamAccountName)"
-            Write-Host "     Nome de Exibição   : $($userInfo.DisplayName)"
-            Write-Host "     Departamento Compl.: $($userInfo.FullDepartment)"
-            Write-Host "     Depto. Principal   : $($userInfo.MainDepartment)"
-            $foundUsersListForPairwise += $userInfo
+            Write-Host "    -> Usuário Encontrado: $($userInfo.SamAccountName)" -FG DarkCyan
+            Write-Host "       Nome de Exibição   : $($userInfo.DisplayName)"
+            Write-Host "       Departamento Compl.: $($userInfo.FullDepartment)"
+            Write-Host "       Depto. Principal   : $($userInfo.MainDepartment)"
+            Write-Host "       Última Alt. Senha  : $($userInfo.PasswordLastSetDisplay) ($($userInfo.PasswordAgeDisplay))" 
+            if (-not $overallFoundUsersInfo.ContainsKey($userInfo.SamAccountName)) { $overallFoundUsersInfo[$userInfo.SamAccountName] = $userInfo }
         } else {
-            Write-Warning $userInfo.ErrorMessage # Exibe o erro já formatado pela função
+            Write-Warning $userInfo.ErrorMessage
         }
     }
     Write-Host "`n--------------------------------------------------"
-    Write-Host "Coleta de informações individuais concluída." -ForegroundColor Green
-
-    Write-Host "`n--- COMPARAÇÃO DE DEPARTAMENTO PRINCIPAL (ENTRE TODOS OS PARES DE USUÁRIOS ENCONTRADOS) ---" -ForegroundColor Cyan
-    if ($foundUsersListForPairwise.Count -lt 2) {
-        Write-Host "São necessários pelo menos dois usuários encontrados para realizar comparações entre pares." -ForegroundColor Yellow
-    } else {
-        Write-Host "Analisando os seguintes usuários encontrados (Nome de Logon e Depto. Principal para comparação):"
-        $foundUsersListForPairwise | ForEach-Object { Write-Host "  - $($_.SamAccountName) ('$($_.MainDepartment)')" }
-        Write-Host ""
-
-        for ($i = 0; $i -lt ($foundUsersListForPairwise.Count - 1); $i++) {
-            for ($j = $i + 1; $j -lt $foundUsersListForPairwise.Count; $j++) {
-                $user1 = $foundUsersListForPairwise[$i]
-                $user2 = $foundUsersListForPairwise[$j]
-
-                $comparisonMessage = ""
-                $comparisonColor = "White"
-                if ($user1.MainDepartment -eq $user2.MainDepartment) {
-                    $comparisonMessage = "PERTENCEM ao MESMO departamento principal ('$($user1.MainDepartment)')"
-                    $comparisonColor = "Green"
-                } else {
-                    $comparisonMessage = "NÃO PERTENCEM ao mesmo departamento principal ('$($user1.MainDepartment)' vs '$($user2.MainDepartment)')"
-                    $comparisonColor = "Red"
-                }
-                Write-Host "Comparando: [$($user1.SamAccountName)] e [$($user2.SamAccountName)] -> $comparisonMessage" -ForegroundColor $comparisonColor
-            }
-        }
-    }
-    Write-Host "`n--------------------------------------------------"
-    Write-Host "Validação entre todos os pares (N x N) concluída." -ForegroundColor Green
+    Write-Host "Coleta de informações individuais concluída." -FG Green
 }
+
+# --- SUMÁRIO FINAL DE DEPARTAMENTOS ---
+Write-Host "`n=================================================="
+Write-Host "SUMÁRIO DE DEPARTAMENTOS PRINCIPAIS DOS USUÁRIOS ENCONTRADOS" -ForegroundColor Magenta
+
+if ($overallFoundUsersInfo.Count -eq 0) {
+    Write-Host "Nenhum usuário foi encontrado com sucesso para resumir." -ForegroundColor Yellow
+} else {
+    $departmentsGrouped = $overallFoundUsersInfo.Values | Group-Object -Property MainDepartment
+    Write-Host "Total de usuários únicos encontrados e processados: $($overallFoundUsersInfo.Count)"
+    Write-Host "Distribuição por Departamento Principal:" -FG Cyan
+    foreach ($group in $departmentsGrouped) {
+        $departmentName = $group.Name
+        $usersInGroupObjects = $group.Group
+        $userSamAccountNamesInGroup = $usersInGroupObjects | ForEach-Object { $_.SamAccountName }
+        $usersDisplay = $userSamAccountNamesInGroup -join ", "
+        if ($usersInGroupObjects.Count -gt 1) {
+            Write-Host "  Departamento Principal: '$departmentName'" -ForegroundColor Green
+            Write-Host "    Usuários ($($usersInGroupObjects.Count)): $usersDisplay"
+            Write-Host "    (Estes usuários compartilham o mesmo departamento principal entre si)" -FG DarkGreen
+        } else {
+            Write-Host "  Departamento Principal: '$departmentName'" -ForegroundColor Cyan
+            Write-Host "    Usuário ($($usersInGroupObjects.Count)): $usersDisplay"
+            Write-Host "    (Este usuário é o único encontrado neste departamento principal na lista processada)" -FG DarkCyan
+        }
+    }
+    Write-Host "`nEste sumário indica quais usuários compartilham o mesmo departamento principal."
+    Write-Host "Usuários em grupos diferentes NÃO compartilham o mesmo departamento principal."
+}
+Write-Host "=================================================="
+Write-Host "Script concluído."
