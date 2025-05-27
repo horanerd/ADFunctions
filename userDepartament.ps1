@@ -1,30 +1,30 @@
 <#
 .SYNOPSIS
-    Lê pares de usuários de um arquivo TXT ou uma lista manual, busca suas informações no AD,
-    compara o departamento principal e, para o Modo Arquivo, mostra a idade da senha do segundo usuário do par.
+    Busca informações de usuários no AD, incluindo status da conta e idade da senha (para usuário2 no modo arquivo),
+    e compara o departamento principal entre pares ou grupos.
 
 .DESCRIPTION
-    Este script opera em dois modos para consultar o Active Directory, encontrar usuários e comparar
+    Este script opera em dois modos para consultar o Active Directory, encontrar usuários,
+    exibir seus detalhes (incluindo se a conta está ativa/desativa) e comparar
     seus "departamentos principais" (a primeira parte do nome do departamento).
 
     Modo Arquivo (-FilePath):
     Processa um arquivo TXT onde cada linha deve conter dois nomes de logon de usuário,
     separados por vírgula (ex: "usuarioA,usuarioB"). Para cada par:
-    1. Busca as informações de ambos os usuários.
+    1. Busca as informações de ambos os usuários, incluindo status da conta.
     2. Para o SEGUNDO usuário do par, exibe há quanto tempo sua senha foi alterada.
     3. Compara os departamentos principais dos dois e informa se são iguais ou diferentes.
 
     Modo Manual/Lista (-UserLogonName):
-    Recebe uma lista de um ou mais nomes de logon. Busca as informações de todos e apresenta
-    um sumário final agrupando usuários por departamento principal. (A idade da senha é
-    coletada e pode ser exibida se o bloco de Write-Host for descomentado).
+    Recebe uma lista de um ou mais nomes de logon. Busca as informações de todos (incluindo status da conta)
+    e apresenta um sumário final agrupando usuários por departamento principal.
 
 .NOTES
     Autor: Seu Nome/Empresa
-    Data: 26/05/2025
+    Data: 27/05/2025
     Requerimentos:
         - Módulo Active Directory para PowerShell (RSAT-AD-PowerShell).
-        - Permissões para ler objetos de usuário no AD (incluindo pwdLastSet).
+        - Permissões para ler objetos de usuário no AD (incluindo pwdLastSet e Enabled).
     Formato do Arquivo TXT (para -FilePath):
         usuario1_linha1,usuario2_linha1
         usuarioA_linha2,usuarioB_linha2
@@ -39,18 +39,17 @@
     Opcional. DN da OU para restringir a pesquisa.
 
 .EXAMPLE
-    # MODO ARQUIVO: Compara pares e mostra idade da senha do segundo usuário
-    # Supondo que C:\temp\pares.txt contenha: "jorge.s,ana.p"
-    .\Compare-ADUserDeptsWithPwdAge.ps1 -FilePath "C:\temp\pares.txt"
+    # MODO ARQUIVO: Compara pares, mostra status da conta e idade da senha do segundo usuário
+    .\Compare-ADUserDeptsEnhanced.ps1 -FilePath "C:\temp\pares.txt"
 
 .EXAMPLE
-    # MODO MANUAL: Busca usuários e apresenta sumário por departamento
-    .\Compare-ADUserDeptsWithPwdAge.ps1 -UserLogonName "userA", "userB", "userC"
+    # MODO MANUAL: Busca usuários (com status da conta) e apresenta sumário por departamento
+    .\Compare-ADUserDeptsEnhanced.ps1 -UserLogonName "userA", "userB", "userC"
 #>
 [CmdletBinding(DefaultParameterSetName = "ByLogonNames")]
 param(
     [Parameter(Mandatory = $true, ParameterSetName = "ByLogonNames", ValueFromPipeline = $true,
-               HelpMessage = "Um ou mais nomes de logon. A saída será um sumário agrupado por departamento principal.")]
+               HelpMessage = "Um ou mais nomes de logon. A saída incluirá status da conta e um sumário agrupado por departamento principal.")]
     [string[]]$UserLogonName,
 
     [Parameter(Mandatory = $true, ParameterSetName = "ByFile",
@@ -71,9 +70,10 @@ function Get-ProcessedUserInfo {
         [string]$SearchBaseForUser
     )
     $trimmedLogonName = $LogonNameInput.Trim()
+    # 'Enabled' é uma propriedade padrão de Get-ADUser, mas pwdLastSet precisa ser especificado.
     $getUserParams = @{
         Identity   = $trimmedLogonName
-        Properties = 'DisplayName', 'Department', 'SamAccountName', 'pwdLastSet' # Adicionado pwdLastSet
+        Properties = 'DisplayName', 'Department', 'SamAccountName', 'pwdLastSet', 'Enabled' # Explicitamente pedindo Enabled para clareza
     }
     if (-not [string]::IsNullOrWhiteSpace($SearchBaseForUser)) {
         $getUserParams.SearchBase = $SearchBaseForUser
@@ -82,11 +82,12 @@ function Get-ProcessedUserInfo {
     $userData = [PSCustomObject]@{
         InputProvided           = $LogonNameInput
         SamAccountName          = $null; DisplayName = $null
+        AccountEnabledStatus    = "N/A" # Novo
         FullDepartment          = "N/A"; MainDepartment = "N/A"
         Found                   = $false; ErrorMessage = $null
-        PasswordLastSetDate     = $null # Data da última alteração de senha (DateTime)
-        PasswordLastSetDisplay  = "N/A" # String formatada da data
-        PasswordAgeDisplay      = "N/A" # String formatada da idade da senha (ex: "X dias atrás")
+        PasswordLastSetDate     = $null 
+        PasswordLastSetDisplay  = "N/A" 
+        PasswordAgeDisplay      = "N/A" 
     }
 
     try {
@@ -95,6 +96,7 @@ function Get-ProcessedUserInfo {
             $userData.SamAccountName = $adUser.SamAccountName
             $userData.DisplayName    = $adUser.DisplayName
             $userData.Found          = $true
+            $userData.AccountEnabledStatus = if ($adUser.Enabled) { "Ativada" } else { "Desativada" } # Novo
 
             $fullDepartmentFromAD = $adUser.Department
             if ([string]::IsNullOrWhiteSpace($fullDepartmentFromAD)) {
@@ -105,27 +107,21 @@ function Get-ProcessedUserInfo {
                 $userData.MainDepartment = ($fullDepartmentFromAD.Split(' ', 2)[0])
             }
 
-            # Processar pwdLastSet
             if ($adUser.pwdLastSet -eq 0) {
                 $userData.PasswordLastSetDisplay = "Usuário deve alterar senha no próximo logon"
-            } elseif ($adUser.pwdLastSet -gt 0) { # Um valor FILETIME válido deve ser positivo
+            } elseif ($adUser.pwdLastSet -gt 0) { 
                 try {
                     $pwdSetDateTimeUtc = [datetime]::FromFileTimeUtc($adUser.pwdLastSet)
-                    $userData.PasswordLastSetDate = $pwdSetDateTimeUtc # Armazena como DateTime UTC
+                    $userData.PasswordLastSetDate = $pwdSetDateTimeUtc
                     $userData.PasswordLastSetDisplay = $pwdSetDateTimeUtc.ToLocalTime().ToString("dd/MM/yyyy HH:mm:ss")
-                    
-                    $age = (Get-Date).ToUniversalTime() - $pwdSetDateTimeUtc # Compara em UTC para consistência, depois pega os dias
-                    if ($age.TotalDays -ge 0) {
-                        $userData.PasswordAgeDisplay = "$($age.Days) dia(s) atrás"
-                    } else {
-                        $userData.PasswordAgeDisplay = "Data no futuro?" # Improvável para pwdLastSet
-                    }
+                    $age = (Get-Date).ToUniversalTime() - $pwdSetDateTimeUtc
+                    $userData.PasswordAgeDisplay = if ($age.TotalDays -ge 0) { "$($age.Days) dia(s) atrás" } else { "Data no futuro?" }
                 } catch {
                     $userData.PasswordLastSetDisplay = "Data de senha inválida (valor bruto: $($adUser.pwdLastSet))"
                     $userData.PasswordAgeDisplay = "Erro na conversão"
                 }
-            } else { # Inclui nulo, -1 (pode ser 'never expires' com flag UAC) ou outros.
-                $userData.PasswordLastSetDisplay = "Senha não definida para expirar ou configuração especial (valor bruto: $($adUser.pwdLastSet))"
+            } else { 
+                $userData.PasswordLastSetDisplay = "Senha não definida para expirar ou config. especial (valor bruto: $($adUser.pwdLastSet))"
             }
         }
     } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
@@ -173,26 +169,17 @@ if ($PSCmdlet.ParameterSetName -eq "ByFile") {
         Write-Host "  Buscando usuário 1: '$userInput1'..." -FG DarkGray
         $userInfo1 = Get-ProcessedUserInfo -LogonNameInput $userInput1 -SearchBaseForUser $SearchBase
         if ($userInfo1.Found) {
-            Write-Host "    -> Encontrado: $($userInfo1.SamAccountName), Depto Principal: $($userInfo1.MainDepartment) (Completo: '$($userInfo1.FullDepartment)')" -FG DarkCyan
+            Write-Host "    -> Encontrado: $($userInfo1.SamAccountName) (Status: $($userInfo1.AccountEnabledStatus)), Depto Principal: $($userInfo1.MainDepartment) (Completo: '$($userInfo1.FullDepartment)')" -FG DarkCyan # Adicionado Status
             if (-not $overallFoundUsersInfo.ContainsKey($userInfo1.SamAccountName)) { $overallFoundUsersInfo[$userInfo1.SamAccountName] = $userInfo1 }
         } else { Write-Warning $userInfo1.ErrorMessage }
         
         Write-Host "  Buscando usuário 2: '$userInput2'..." -FG DarkGray
         $userInfo2 = Get-ProcessedUserInfo -LogonNameInput $userInput2 -SearchBaseForUser $SearchBase
         if ($userInfo2.Found) {
-            Write-Host "    -> Encontrado: $($userInfo2.SamAccountName), Depto Principal: $($userInfo2.MainDepartment) (Completo: '$($userInfo2.FullDepartment)')" -FG DarkCyan
-            
-            # --- INÍCIO DAS LINHAS DE DEPURAÇÃO ---
-            Write-Host "    DEBUG (Usuário 2): PwdLastSetDisplay: '$($userInfo2.PasswordLastSetDisplay)'" -ForegroundColor Magenta
-            Write-Host "    DEBUG (Usuário 2): PwdAgeDisplay    : '$($userInfo2.PasswordAgeDisplay)'" -ForegroundColor Magenta
-            Write-Host "    DEBUG (Usuário 2): PwdLastSetDate (UTC): '$($userInfo2.PasswordLastSetDate)'" -ForegroundColor Magenta # Mostra a data UTC armazenada
-            # --- FIM DAS LINHAS DE DEPURAÇÃO ---
-
+            Write-Host "    -> Encontrado: $($userInfo2.SamAccountName) (Status: $($userInfo2.AccountEnabledStatus)), Depto Principal: $($userInfo2.MainDepartment) (Completo: '$($userInfo2.FullDepartment)')" -FG DarkCyan # Adicionado Status
             Write-Host "       Última alteração de senha (para $($userInfo2.SamAccountName)): $($userInfo2.PasswordLastSetDisplay) - $($userInfo2.PasswordAgeDisplay)" -ForegroundColor Blue 
             if (-not $overallFoundUsersInfo.ContainsKey($userInfo2.SamAccountName)) { $overallFoundUsersInfo[$userInfo2.SamAccountName] = $userInfo2 }
-        } else { 
-            Write-Warning $userInfo2.ErrorMessage 
-        }
+        } else { Write-Warning $userInfo2.ErrorMessage }
 
         if ($userInfo1.Found -and $userInfo2.Found) {
             $comparisonMessage = ""; $comparisonColor = "White"
@@ -226,6 +213,7 @@ elseif ($PSCmdlet.ParameterSetName -eq "ByLogonNames") {
         if ($userInfo.Found) {
             Write-Host "    -> Usuário Encontrado: $($userInfo.SamAccountName)" -FG DarkCyan
             Write-Host "       Nome de Exibição   : $($userInfo.DisplayName)"
+            Write-Host "       Status da Conta    : $($userInfo.AccountEnabledStatus)" # Adicionado Status
             Write-Host "       Departamento Compl.: $($userInfo.FullDepartment)"
             Write-Host "       Depto. Principal   : $($userInfo.MainDepartment)"
             Write-Host "       Última Alt. Senha  : $($userInfo.PasswordLastSetDisplay) ($($userInfo.PasswordAgeDisplay))" 
@@ -251,8 +239,13 @@ if ($overallFoundUsersInfo.Count -eq 0) {
     foreach ($group in $departmentsGrouped) {
         $departmentName = $group.Name
         $usersInGroupObjects = $group.Group
-        $userSamAccountNamesInGroup = $usersInGroupObjects | ForEach-Object { $_.SamAccountName }
-        $usersDisplay = $userSamAccountNamesInGroup -join ", "
+        
+        $userDisplayList = @()
+        foreach($usrObj in $usersInGroupObjects){
+            $userDisplayList += "$($usrObj.SamAccountName) ($($usrObj.AccountEnabledStatus))" # Adicionado Status ao sumário
+        }
+        $usersDisplay = $userDisplayList -join ", "
+
         if ($usersInGroupObjects.Count -gt 1) {
             Write-Host "  Departamento Principal: '$departmentName'" -ForegroundColor Green
             Write-Host "    Usuários ($($usersInGroupObjects.Count)): $usersDisplay"
