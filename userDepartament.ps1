@@ -27,9 +27,9 @@
     Consulta informações para os três usuários especificados.
 
 .NOTES
-    Autor: [Seu Nome]
+    Autor: Guilherme De Sousa do Nascimento
     Versão: 1.0
-    Data: [Data]
+    Data: 27/05/2025
 #>
 
 param (
@@ -49,252 +49,94 @@ param (
 try {
     Import-Module ActiveDirectory -ErrorAction Stop
 } catch {
-    Write-Error "Falha ao carregar o módulo ActiveDirectory: $_"
+    Write-Error "Erro ao importar o módulo ActiveDirectory: $_"
     exit 1
 }
 
-# Função auxiliar para converter pwdLastSet em data legível e calcular idade
 function Convert-PwdLastSet {
-    param (
-        [object]$pwdLastSet
-    )
-
+    param ([object]$pwdLastSet)
     if ($null -eq $pwdLastSet -or $pwdLastSet -le 0) {
-        if ($pwdLastSet -eq 0) {
-            return @{
-                Status = "Usuário deve alterar senha no próximo logon"
-                Age    = $null
-                Date   = $null
-                Raw    = $pwdLastSet
-            }
-        } else {
-            return @{
-                Status = "Senha não definida para expirar ou config. especial (valor bruto: $pwdLastSet)"
-                Age    = $null
-                Date   = $null
-                Raw    = $pwdLastSet
-            }
-        }
+        return "Senha indefinida ou usuário deve alterá-la ao logar"
     }
-
     try {
         $date = [datetime]::FromFileTime($pwdLastSet)
-        $age = [math]::Floor(([datetime]::Now - $date).TotalDays)
-        
-        return @{
-            Status = "$age dia(s) atrás"
-            Age    = $age
-            Date   = $date.ToString("dd/MM/yyyy HH:mm:ss")
-            Raw    = $pwdLastSet
-        }
+        $age = [math]::Floor((Get-Date - $date).TotalDays)
+        return "$($date.ToString('dd/MM/yyyy')) ($age dias atrás)"
     } catch {
-        return @{
-            Status = "Erro na conversão de pwdLastSet: $_ (valor bruto: $pwdLastSet)"
-            Age    = $null
-            Date   = $null
-            Raw    = $pwdLastSet
-        }
+        return "Erro ao converter pwdLastSet"
     }
 }
 
-# Função auxiliar para processar informações do usuário
-function Get-ProcessedUserInfo {
+function Get-UserInfo {
     param (
-        [string]$UserIdentifier,
-        [string]$SearchBase
+        [string[]]$Users
     )
 
-    $params = @{
-        Identity = $UserIdentifier
-        Properties = 'SamAccountName', 'DisplayName', 'Enabled', 'Department', 'pwdLastSet', 'UserPrincipalName', 'SID'
-        ErrorAction = 'SilentlyContinue'
-    }
+    $filterScript = { $_ }
+    $props = 'SamAccountName','DisplayName','Enabled','Department','pwdLastSet','UserPrincipalName','SID','LockedOut'
 
-    if ($SearchBase) {
-        $params['SearchBase'] = $SearchBase
-    }
+    $result = @()
+    foreach ($user in $Users) {
+        $params = @{ Identity = $user; Properties = $props; ErrorAction = 'SilentlyContinue' }
+        if ($SearchBase) { $params.SearchBase = $SearchBase }
 
-    try {
-        $adUser = Get-ADUser @params
+        $u = Get-ADUser @params
+        if ($u) {
+            $dept = if ($u.Department) { $u.Department.Trim() } else { 'Não especificado' }
+            $mainDept = ($dept -split '\s+')[0]
+            $pwdLastSet = Convert-PwdLastSet -pwdLastSet $u.pwdLastSet
 
-        if (-not $adUser) {
-            return [PSCustomObject]@{
-                Found               = $false
-                ErrorMessage       = "Usuário '$UserIdentifier' não encontrado"
-                SamAccountName     = $null
-                DisplayName       = $null
-                AccountStatus     = $null
-                DepartmentFull    = $null
-                MainDepartment    = $null
-                PwdLastSetInfo     = $null
-                UserPrincipalName  = $null
-                SID               = $null
+            $result += [PSCustomObject]@{
+                Usuario   = $u.SamAccountName
+                Nome      = $u.DisplayName
+                Ativo     = if ($u.Enabled) { 'Sim' } else { 'Não' }
+                Bloqueado = if ($u.LockedOut) { 'Sim' } else { 'Não' }
+                DeptMain  = $mainDept
+                DeptFull  = $dept
+                SenhaUltAlteracao = $pwdLastSet
             }
-        }
-
-        # Processa o departamento
-        $deptFull = if ([string]::IsNullOrEmpty($adUser.Department)) { "Não especificado" } else { $adUser.Department.Trim() }
-        $mainDept = if ($deptFull -eq "Não especificado") { $deptFull } else { ($deptFull -split '\s+')[0] }
-
-        # Processa pwdLastSet
-        $pwdInfo = Convert-PwdLastSet -pwdLastSet $adUser.pwdLastSet
-
-        return [PSCustomObject]@{
-            Found               = $true
-            ErrorMessage       = $null
-            SamAccountName     = $adUser.SamAccountName
-            DisplayName       = $adUser.DisplayName
-            AccountStatus     = if ($adUser.Enabled) { "Ativada" } else { "Desativada" }
-            DepartmentFull    = $deptFull
-            MainDepartment    = $mainDept
-            PwdLastSetInfo    = $pwdInfo
-            UserPrincipalName = $adUser.UserPrincipalName
-            SID              = $adUser.SID
-        }
-    } catch {
-        return [PSCustomObject]@{
-            Found               = $false
-            ErrorMessage       = "Erro ao buscar usuário '$UserIdentifier': $_"
-            SamAccountName     = $null
-            DisplayName       = $null
-            AccountStatus     = $null
-            DepartmentFull    = $null
-            MainDepartment    = $null
-            PwdLastSetInfo     = $null
-            UserPrincipalName  = $null
-            SID               = $null
-        }
-    }
-}
-
-# Variáveis globais para armazenar usuários processados e pwdLastSet já exibidos
-$global:processedUsers = @{}
-$global:shownPwdLastSet = @{}
-$global:allFoundUsers = @{}
-
-# Função para exibir informações do usuário
-function Show-UserInfo {
-    param (
-        [PSCustomObject]$UserInfo,
-        [bool]$ShowPwdLastSet = $true,
-        [bool]$IsSecondUser = $false
-    )
-
-    if (-not $UserInfo.Found) {
-        Write-Warning $UserInfo.ErrorMessage
-        return
-    }
-
-    # Adiciona usuário à lista global de encontrados
-    if (-not $global:allFoundUsers.ContainsKey($UserInfo.SamAccountName)) {
-        $global:allFoundUsers[$UserInfo.SamAccountName] = $UserInfo
-    }
-
-    Write-Host "`nInformações do Usuário:" -ForegroundColor Cyan
-    Write-Host "  SamAccountName: $($UserInfo.SamAccountName)"
-    Write-Host "  DisplayName: $($UserInfo.DisplayName)"
-    Write-Host "  Status da Conta: $($UserInfo.AccountStatus)"
-    Write-Host "  Departamento Principal: $($UserInfo.MainDepartment)"
-    Write-Host "  Departamento Completo: $($UserInfo.DepartmentFull)"
-
-    if ($ShowPwdLastSet) {
-        if ($IsSecondUser -and $global:shownPwdLastSet.ContainsKey($UserInfo.SamAccountName)) {
-            Write-Warning "(Info PwdLastSet para $($UserInfo.SamAccountName) já exibida)"
         } else {
-            $pwdInfo = $UserInfo.PwdLastSetInfo
-            if ($pwdInfo.Date) {
-                Write-Host "  Última alteração de senha: $($pwdInfo.Date) ($($pwdInfo.Status))"
-            } else {
-                Write-Host "  Última alteração de senha: $($pwdInfo.Status)"
-            }
-            
-            if ($IsSecondUser) {
-                $global:shownPwdLastSet[$UserInfo.SamAccountName] = $true
+            $result += [PSCustomObject]@{
+                Usuario   = $user
+                Nome      = 'Não encontrado'
+                Ativo     = 'N/D'
+                Bloqueado = 'N/D'
+                DeptMain  = 'N/D'
+                DeptFull  = 'N/D'
+                SenhaUltAlteracao = 'N/D'
             }
         }
     }
+    return $result
 }
 
-# Modo Arquivo
+function Show-Table {
+    param ([array]$UserInfos)
+    $UserInfos | Sort-Object DeptMain, Usuario | Format-Table -AutoSize
+}
+
 if ($PSCmdlet.ParameterSetName -eq 'FileMode') {
-    Write-Host "`nProcessando arquivo: $FilePath" -ForegroundColor Magenta
-    $lines = Get-Content $FilePath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-
+    $lines = Get-Content $FilePath | Where-Object { $_.Trim() -ne '' }
     foreach ($line in $lines) {
-        $trimmedLine = $line.Trim()
-        Write-Host "`n=== Processando linha: '$trimmedLine' ===" -ForegroundColor Yellow
-
-        $userInputs = $trimmedLine -split ',' | ForEach-Object { $_.Trim() }
-        
-        # Validação do formato da linha
-        if ($userInputs.Count -ne 2 -or [string]::IsNullOrEmpty($userInputs[0]) -or [string]::IsNullOrEmpty($userInputs[1])) {
-            Write-Warning "Formato inválido na linha: '$trimmedLine'. Esperado: 'usuario1, usuario2'. Esta linha será ignorada."
+        $pair = $line.Split(',') | ForEach-Object { $_.Trim() }
+        if ($pair.Count -ne 2 -or $pair[0] -eq $pair[1]) {
+            Write-Warning "Linha inválida: '$line'"
             continue
         }
-
-        # Verifica se os usuários são idênticos
-        if ($userInputs[0] -eq $userInputs[1]) {
-            Write-Error "ENTRADA INCORRETA NA LINHA: '$trimmedLine'. Os dois identificadores de usuário são idênticos ('$($userInputs[0])'). Um usuário não pode ser comparado consigo mesmo. Este par será ignorado."
-            continue
-        }
-
-        $user1 = $userInputs[0]
-        $user2 = $userInputs[1]
-
-        # Obtém informações dos usuários
-        $userInfo1 = Get-ProcessedUserInfo -UserIdentifier $user1 -SearchBase $SearchBase
-        $userInfo2 = Get-ProcessedUserInfo -UserIdentifier $user2 -SearchBase $SearchBase
-
-        # Exibe informações básicas para ambos os usuários
-        Write-Host "`nUsuário 1:" -ForegroundColor Green
-        Show-UserInfo -UserInfo $userInfo1 -ShowPwdLastSet $false
-
-        Write-Host "`nUsuário 2:" -ForegroundColor Green
-        Show-UserInfo -UserInfo $userInfo2 -ShowPwdLastSet $true -IsSecondUser $true
-
-        # Comparação de departamento principal
-        if ($userInfo1.Found -and $userInfo2.Found) {
-            if ($userInfo1.MainDepartment -eq $userInfo2.MainDepartment) {
-                Write-Host "`nRESULTADO PARA O PAR: PERTENCEM ao MESMO departamento principal ('$($userInfo1.MainDepartment)')" -ForegroundColor Green
-            } else {
-                Write-Host "`nRESULTADO PARA O PAR: NÃO PERTENCEM ao mesmo departamento principal ('$($userInfo1.MainDepartment)' vs '$($userInfo2.MainDepartment)')" -ForegroundColor Red
-            }
+        Write-Host "\nComparando: $($pair[0]) x $($pair[1])" -ForegroundColor Yellow
+        $infos = Get-UserInfo -Users $pair
+        Show-Table -UserInfos $infos
+        if ($infos[0].DeptMain -eq $infos[1].DeptMain) {
+            Write-Host "Mesma unidade: $($infos[0].DeptMain)" -ForegroundColor Green
         } else {
-            Write-Warning "Não foi possível comparar departamentos para este par (um ou ambos os usuários não foram encontrados)"
+            Write-Host "Departamentos diferentes: $($infos[0].DeptMain) vs $($infos[1].DeptMain)" -ForegroundColor Red
         }
     }
-}
-
-# Modo Lista
-if ($PSCmdlet.ParameterSetName -eq 'ListMode') {
-    Write-Host "`nProcessando lista de usuários: $($UserLogonName -join ', ')" -ForegroundColor Magenta
-
-    foreach ($user in $UserLogonName) {
-        Write-Host "`n=== Processando usuário: '$user' ===" -ForegroundColor Yellow
-        $userInfo = Get-ProcessedUserInfo -UserIdentifier $user -SearchBase $SearchBase
-        Show-UserInfo -UserInfo $userInfo -ShowPwdLastSet $true
-    }
-}
-
-# Sumário Final
-Write-Host "`n=== SUMÁRIO FINAL ===" -ForegroundColor Magenta
-
-if ($global:allFoundUsers.Count -eq 0) {
-    Write-Host "Nenhum usuário foi encontrado durante a execução do script." -ForegroundColor Yellow
+} elseif ($PSCmdlet.ParameterSetName -eq 'ListMode') {
+    $infos = Get-UserInfo -Users $UserLogonName
+    Show-Table -UserInfos $infos
 } else {
-    # Agrupa usuários por departamento principal
-    $deptGroups = $global:allFoundUsers.Values | Group-Object -Property MainDepartment
+    Write-Error "Modo de execução não reconhecido."
+} 
 
-    foreach ($group in $deptGroups) {
-        $userList = $group.Group | ForEach-Object { "$($_.SamAccountName) ($($_.AccountStatus))" }
-        $userListString = $userList -join ', '
-
-        if ($group.Count -gt 1) {
-            Write-Host "`nDepartamento Principal: '$($group.Name)': $userListString (Estes usuários compartilham o mesmo departamento principal entre si)" -ForegroundColor Cyan
-        } else {
-            Write-Host "`nDepartamento Principal: '$($group.Name)': $userListString (Este usuário é o único encontrado neste departamento principal na lista processada)" -ForegroundColor Cyan
-        }
-    }
-}
-
-Write-Host "`nProcessamento concluído.`n" -ForegroundColor Green
+Write-Host "\nProcessamento finalizado." -ForegroundColor Cyan
