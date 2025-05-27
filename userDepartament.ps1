@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Busca informações de usuários no AD, incluindo status da conta e idade da senha (para usuário2 no modo arquivo),
-    e compara o departamento principal entre pares ou grupos.
+    e compara o departamento principal entre pares ou grupos. Valida se os usuários em um par de arquivo são distintos.
 
 .DESCRIPTION
     Este script opera em dois modos para consultar o Active Directory, encontrar usuários,
@@ -9,8 +9,9 @@
     seus "departamentos principais" (a primeira parte do nome do departamento).
 
     Modo Arquivo (-FilePath):
-    Processa um arquivo TXT onde cada linha deve conter dois nomes de logon de usuário,
-    separados por vírgula (ex: "usuarioA,usuarioB"). Para cada par:
+    Processa um arquivo TXT onde cada linha deve conter dois nomes de logon de usuário DISTINTOS,
+    separados por vírgula (ex: "usuarioA,usuarioB"). Se os usuários na linha forem idênticos,
+    um aviso é emitido e o par é pulado. Para cada par válido:
     1. Busca as informações de ambos os usuários, incluindo status da conta.
     2. Para o SEGUNDO usuário do par, exibe há quanto tempo sua senha foi alterada.
     3. Compara os departamentos principais dos dois e informa se são iguais ou diferentes.
@@ -26,8 +27,9 @@
         - Módulo Active Directory para PowerShell (RSAT-AD-PowerShell).
         - Permissões para ler objetos de usuário no AD (incluindo pwdLastSet e Enabled).
     Formato do Arquivo TXT (para -FilePath):
-        usuario1_linha1,usuario2_linha1
+        usuario1_distinto_de_usuario2,usuario2_distinto_de_usuario1
         usuarioA_linha2,usuarioB_linha2
+        # Linhas com "usuarioX,usuarioX" serão puladas com aviso.
 
 .PARAMETER FilePath
     (Modo Arquivo) Caminho para um arquivo TXT com pares "usuario1,usuario2" por linha.
@@ -40,11 +42,11 @@
 
 .EXAMPLE
     # MODO ARQUIVO: Compara pares, mostra status da conta e idade da senha do segundo usuário
-    .\Compare-ADUserDeptsEnhanced.ps1 -FilePath "C:\temp\pares.txt"
+    .\Compare-ADUserDeptsWithValidation.ps1 -FilePath "C:\temp\pares.txt"
 
 .EXAMPLE
     # MODO MANUAL: Busca usuários (com status da conta) e apresenta sumário por departamento
-    .\Compare-ADUserDeptsEnhanced.ps1 -UserLogonName "userA", "userB", "userC"
+    .\Compare-ADUserDeptsWithValidation.ps1 -UserLogonName "userA", "userB", "userC"
 #>
 [CmdletBinding(DefaultParameterSetName = "ByLogonNames")]
 param(
@@ -70,10 +72,9 @@ function Get-ProcessedUserInfo {
         [string]$SearchBaseForUser
     )
     $trimmedLogonName = $LogonNameInput.Trim()
-    # 'Enabled' é uma propriedade padrão de Get-ADUser, mas pwdLastSet precisa ser especificado.
     $getUserParams = @{
         Identity   = $trimmedLogonName
-        Properties = 'DisplayName', 'Department', 'SamAccountName', 'pwdLastSet', 'Enabled' # Explicitamente pedindo Enabled para clareza
+        Properties = 'DisplayName', 'Department', 'SamAccountName', 'pwdLastSet', 'Enabled'
     }
     if (-not [string]::IsNullOrWhiteSpace($SearchBaseForUser)) {
         $getUserParams.SearchBase = $SearchBaseForUser
@@ -82,7 +83,7 @@ function Get-ProcessedUserInfo {
     $userData = [PSCustomObject]@{
         InputProvided           = $LogonNameInput
         SamAccountName          = $null; DisplayName = $null
-        AccountEnabledStatus    = "N/A" # Novo
+        AccountEnabledStatus    = "N/A" 
         FullDepartment          = "N/A"; MainDepartment = "N/A"
         Found                   = $false; ErrorMessage = $null
         PasswordLastSetDate     = $null 
@@ -96,7 +97,7 @@ function Get-ProcessedUserInfo {
             $userData.SamAccountName = $adUser.SamAccountName
             $userData.DisplayName    = $adUser.DisplayName
             $userData.Found          = $true
-            $userData.AccountEnabledStatus = if ($adUser.Enabled) { "Ativada" } else { "Desativada" } # Novo
+            $userData.AccountEnabledStatus = if ($adUser.Enabled) { "Ativada" } else { "Desativada" }
 
             $fullDepartmentFromAD = $adUser.Department
             if ([string]::IsNullOrWhiteSpace($fullDepartmentFromAD)) {
@@ -157,26 +158,35 @@ if ($PSCmdlet.ParameterSetName -eq "ByFile") {
         Write-Host "Processando linha: '$line'" -FG Yellow
         $userPairStrings = $line.Split(',')
         if ($userPairStrings.Count -ne 2) {
-            Write-Warning "Linha '$line' formato inválido. Pulando."; continue
+            Write-Warning "Linha '$line' formato inválido (não contém dois usuários separados por vírgula). Pulando."; continue
         }
         $userInput1 = $userPairStrings[0].Trim()
         $userInput2 = $userPairStrings[1].Trim()
+
         if ([string]::IsNullOrWhiteSpace($userInput1) -or [string]::IsNullOrWhiteSpace($userInput2)) {
-            Write-Warning "Linha '$line' nome de usuário vazio. Pulando."; continue
+            Write-Warning "Linha '$line' contém um nome de usuário vazio após o processamento. Pulando."; continue
         }
-        Write-Host "Par: [$userInput1] e [$userInput2]"
+
+        # --- NOVA REGRA DE NEGÓCIO: Verificar se os usuários são idênticos ---
+        if ($userInput1 -eq $userInput2) { # -eq é case-insensitive para strings por padrão no PowerShell
+            Write-Warning "Linha '$line' contém identificadores de usuário idênticos ('$userInput1'). Um usuário não pode ser comparado consigo mesmo neste contexto. Pulando este par."
+            continue # Pula para a próxima linha do arquivo
+        }
+        # --- FIM DA NOVA REGRA DE NEGÓCIO ---
+
+        Write-Host "Par a comparar: [$userInput1] e [$userInput2]"
 
         Write-Host "  Buscando usuário 1: '$userInput1'..." -FG DarkGray
         $userInfo1 = Get-ProcessedUserInfo -LogonNameInput $userInput1 -SearchBaseForUser $SearchBase
         if ($userInfo1.Found) {
-            Write-Host "    -> Encontrado: $($userInfo1.SamAccountName) (Status: $($userInfo1.AccountEnabledStatus)), Depto Principal: $($userInfo1.MainDepartment) (Completo: '$($userInfo1.FullDepartment)')" -FG DarkCyan # Adicionado Status
+            Write-Host "    -> Encontrado: $($userInfo1.SamAccountName) (Status: $($userInfo1.AccountEnabledStatus)), Depto Principal: $($userInfo1.MainDepartment) (Completo: '$($userInfo1.FullDepartment)')" -FG DarkCyan
             if (-not $overallFoundUsersInfo.ContainsKey($userInfo1.SamAccountName)) { $overallFoundUsersInfo[$userInfo1.SamAccountName] = $userInfo1 }
         } else { Write-Warning $userInfo1.ErrorMessage }
         
         Write-Host "  Buscando usuário 2: '$userInput2'..." -FG DarkGray
         $userInfo2 = Get-ProcessedUserInfo -LogonNameInput $userInput2 -SearchBaseForUser $SearchBase
         if ($userInfo2.Found) {
-            Write-Host "    -> Encontrado: $($userInfo2.SamAccountName) (Status: $($userInfo2.AccountEnabledStatus)), Depto Principal: $($userInfo2.MainDepartment) (Completo: '$($userInfo2.FullDepartment)')" -FG DarkCyan # Adicionado Status
+            Write-Host "    -> Encontrado: $($userInfo2.SamAccountName) (Status: $($userInfo2.AccountEnabledStatus)), Depto Principal: $($userInfo2.MainDepartment) (Completo: '$($userInfo2.FullDepartment)')" -FG DarkCyan
             Write-Host "       Última alteração de senha (para $($userInfo2.SamAccountName)): $($userInfo2.PasswordLastSetDisplay) - $($userInfo2.PasswordAgeDisplay)" -ForegroundColor Blue 
             if (-not $overallFoundUsersInfo.ContainsKey($userInfo2.SamAccountName)) { $overallFoundUsersInfo[$userInfo2.SamAccountName] = $userInfo2 }
         } else { Write-Warning $userInfo2.ErrorMessage }
@@ -198,6 +208,7 @@ if ($PSCmdlet.ParameterSetName -eq "ByFile") {
 
 }
 elseif ($PSCmdlet.ParameterSetName -eq "ByLogonNames") {
+    # (Lógica do Modo Manual/Lista - esta validação de usuários idênticos em um par não se aplica aqui da mesma forma)
     $logonNamesToProcess = $UserLogonName | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     if ($logonNamesToProcess.Count -eq 0) { Write-Warning "Nenhum nome de usuário válido fornecido."; exit 1 }
     
@@ -213,7 +224,7 @@ elseif ($PSCmdlet.ParameterSetName -eq "ByLogonNames") {
         if ($userInfo.Found) {
             Write-Host "    -> Usuário Encontrado: $($userInfo.SamAccountName)" -FG DarkCyan
             Write-Host "       Nome de Exibição   : $($userInfo.DisplayName)"
-            Write-Host "       Status da Conta    : $($userInfo.AccountEnabledStatus)" # Adicionado Status
+            Write-Host "       Status da Conta    : $($userInfo.AccountEnabledStatus)" 
             Write-Host "       Departamento Compl.: $($userInfo.FullDepartment)"
             Write-Host "       Depto. Principal   : $($userInfo.MainDepartment)"
             Write-Host "       Última Alt. Senha  : $($userInfo.PasswordLastSetDisplay) ($($userInfo.PasswordAgeDisplay))" 
@@ -227,6 +238,7 @@ elseif ($PSCmdlet.ParameterSetName -eq "ByLogonNames") {
 }
 
 # --- SUMÁRIO FINAL DE DEPARTAMENTOS ---
+# (Esta seção permanece a mesma)
 Write-Host "`n=================================================="
 Write-Host "SUMÁRIO DE DEPARTAMENTOS PRINCIPAIS DOS USUÁRIOS ENCONTRADOS" -ForegroundColor Magenta
 
@@ -242,7 +254,7 @@ if ($overallFoundUsersInfo.Count -eq 0) {
         
         $userDisplayList = @()
         foreach($usrObj in $usersInGroupObjects){
-            $userDisplayList += "$($usrObj.SamAccountName) ($($usrObj.AccountEnabledStatus))" # Adicionado Status ao sumário
+            $userDisplayList += "$($usrObj.SamAccountName) ($($usrObj.AccountEnabledStatus))" 
         }
         $usersDisplay = $userDisplayList -join ", "
 
