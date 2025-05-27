@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-    Busca e exibe informações de um ou mais usuários específicos no Active Directory
-    e valida se pertencem ao mesmo departamento principal (primeira parte do nome do departamento).
+    Lê pares de usuários de um arquivo TXT, busca suas informações no AD
+    e compara o departamento principal para cada par individualmente.
 
 .DESCRIPTION
-    Este script consulta o Active Directory para encontrar um ou mais usuários específicos
-    fornecendo seus nomes de logon. Exibe o SamAccountName, nome de exibição,
-    departamento completo de cada usuário e, ao final, informa se todos os usuários encontrados
-    compartilham o mesmo departamento principal (considerando apenas a string antes do primeiro espaço
-    no nome do departamento, ou o nome completo se não houver espaços).
+    Este script processa um arquivo TXT onde cada linha deve conter dois nomes de logon de usuário,
+    separados por vírgula (ex: "usuarioA,usuarioB"). Para cada par lido do arquivo:
+    1. Busca as informações de ambos os usuários no Active Directory.
+    2. Determina o "departamento principal" de cada um (primeira parte do nome do departamento).
+    3. Compara os departamentos principais e informa se são iguais ou diferentes para aquele par específico.
 
 .NOTES
     Autor: Seu Nome/Empresa
@@ -16,140 +16,178 @@
     Requerimentos:
         - Módulo Active Directory para PowerShell (RSAT-AD-PowerShell).
         - Permissões para ler objetos de usuário no AD.
+    Formato do Arquivo TXT:
+        usuario1_linha1,usuario2_linha1
+        usuarioA_linha2,usuarioB_linha2
+        # ... e assim por diante
 
-.PARAMETER UserLogonName
-    Um ou mais nomes de logon de usuário a serem pesquisados. Separe múltiplos nomes
-    por vírgula. Pode ser o SamAccountName, UserPrincipalName, DN, GUID ou SID.
-    Obrigatório.
+.PARAMETER FilePath
+    Caminho para um arquivo TXT contendo um par de nomes de logon de usuário por linha,
+    separados por vírgula. Obrigatório.
 
 .PARAMETER SearchBase
-    Opcional. DN da OU para restringir a pesquisa para todos os usuários fornecidos.
+    Opcional. DN da OU para restringir a pesquisa de todos os usuários mencionados no arquivo.
 
 .EXAMPLE
-    .\Get-ADUsersInfoAndCompareMainDept.ps1 -UserLogonName "josedasilva", "anapereira"
-    (Busca os usuários e valida se o início de seus departamentos é o mesmo.
-     Ex: "Vendas" e "Vendas Internas" seriam considerados do mesmo departamento principal "Vendas".)
+    # Supondo que o arquivo C:\temp\pares_usuarios.txt contenha:
+    # josedasilva,anapereira
+    # ricardo.alves@empresa.com,maria.souza
+    .\Compare-ADUserPairDepartmentsFromFile.ps1 -FilePath "C:\temp\pares_usuarios.txt"
 
 .EXAMPLE
-    .\Get-ADUsersInfoAndCompareMainDept.ps1 -UserLogonName "ricardo.alves", "maria.souza"
-    (Se Ricardo é "Diretoria12 Financeiro" e Maria é "Diretoria12 RH", serão considerados do mesmo
-     departamento principal "Diretoria12".)
+    .\Compare-ADUserPairDepartmentsFromFile.ps1 -FilePath "C:\temp\pares.txt" -SearchBase "OU=Funcionarios,DC=empresa,DC=com"
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, HelpMessage = "Um ou mais nomes de logon de usuário (SamAccountName, UPN, DN, GUID ou SID). Separe múltiplos nomes por vírgula se fornecer diretamente na linha de comando.")]
-    [string[]]$UserLogonName,
+    [Parameter(Mandatory = $true,
+               HelpMessage = "Caminho para um arquivo TXT contendo um par de nomes de logon de usuário por linha, separados por vírgula.")]
+    [string]$FilePath,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Opcional. DN da OU para restringir a pesquisa para todos os usuários fornecidos.")]
+    [Parameter(Mandatory = $false, HelpMessage = "Opcional. DN da OU para restringir a pesquisa para todos os usuários.")]
     [string]$SearchBase
 )
 
-# Importar o módulo do Active Directory se não estiver carregado
+# --- INÍCIO DA FUNÇÃO AUXILIAR ---
+function Get-ProcessedUserInfo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LogonNameInput,
+
+        [Parameter(Mandatory = $false)]
+        [string]$SearchBaseForUser
+    )
+
+    $trimmedLogonName = $LogonNameInput.Trim()
+    Write-Host "  Buscando detalhes para: '$trimmedLogonName'..." -ForegroundColor DarkGray
+
+    $getUserParams = @{
+        Identity   = $trimmedLogonName
+        Properties = 'DisplayName', 'Department', 'SamAccountName'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SearchBaseForUser)) {
+        $getUserParams.SearchBase = $SearchBaseForUser
+    }
+
+    # Objeto para armazenar os dados do usuário processado
+    $userData = [PSCustomObject]@{
+        InputProvided   = $LogonNameInput # Mantém a entrada original
+        SamAccountName  = $null
+        DisplayName     = $null
+        FullDepartment  = "N/A"
+        MainDepartment  = "N/A"
+        Found           = $false
+        ErrorMessage    = $null
+    }
+
+    try {
+        $adUser = Get-ADUser @getUserParams
+        
+        if ($adUser) {
+            $userData.SamAccountName = $adUser.SamAccountName
+            $userData.DisplayName    = $adUser.DisplayName
+            $userData.Found          = $true
+
+            $fullDepartmentFromAD = $adUser.Department
+            if ([string]::IsNullOrWhiteSpace($fullDepartmentFromAD)) {
+                $userData.FullDepartment = "Não especificado"
+                $userData.MainDepartment = "Não especificado" 
+            } else {
+                $userData.FullDepartment = $fullDepartmentFromAD
+                $userData.MainDepartment = ($fullDepartmentFromAD.Split(' ', 2)[0])
+            }
+            Write-Host "    -> Encontrado: $($adUser.SamAccountName), Depto Principal: $($userData.MainDepartment) (Completo: $($userData.FullDepartment))" -ForegroundColor DarkCyan
+        }
+    }
+    catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+        $userData.ErrorMessage = "Usuário '$trimmedLogonName' não encontrado."
+        Write-Warning $userData.ErrorMessage
+    }
+    catch {
+        $userData.ErrorMessage = "Erro ao buscar '$trimmedLogonName': $($_.Exception.Message)"
+        Write-Warning $userData.ErrorMessage
+    }
+    return $userData
+}
+# --- FIM DA FUNÇÃO AUXILIAR ---
+
+# Importar o módulo do Active Directory
 if (-not (Get-Module ActiveDirectory)) {
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
         Write-Host "Módulo ActiveDirectory importado com sucesso." -ForegroundColor Green
     }
     catch {
-        Write-Error "Falha ao importar o módulo ActiveDirectory. Certifique-se de que as Ferramentas de Administração de Servidor Remoto (RSAT) para AD DS estão instaladas."
+        Write-Error "Falha ao importar o módulo ActiveDirectory. RSAT para AD DS deve estar instalado."
         exit 1
     }
 }
 
-$foundUsersInfo = @() # Array para armazenar informações dos usuários encontrados
+# Validar se o arquivo de entrada existe
+if (-not (Test-Path -Path $FilePath -PathType Leaf)) {
+    Write-Error "Arquivo de entrada não encontrado em '$FilePath'."
+    exit 1
+}
 
-# Loop para processar cada nome de logon fornecido
-foreach ($logonNameInput in $UserLogonName) {
-    Write-Host "`n--------------------------------------------------"
-    Write-Host "Processando solicitação para: '$logonNameInput'" -ForegroundColor Yellow
+Write-Host "Processando arquivo de pares: '$FilePath'" -ForegroundColor Cyan
+$linesFromFile = Get-Content -Path $FilePath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
-    $getUserParams = @{
-        Identity   = $logonNameInput
-        Properties = 'DisplayName', 'Department', 'SamAccountName'
+if ($linesFromFile.Count -eq 0) {
+    Write-Warning "O arquivo '$FilePath' está vazio ou não contém linhas válidas para processamento."
+    exit 1
+}
+
+Write-Host "Total de pares (linhas) a processar: $($linesFromFile.Count)"
+
+# Loop para processar cada linha (par) do arquivo
+foreach ($line in $linesFromFile) {
+    Write-Host "`n=================================================="
+    Write-Host "Processando linha do arquivo: '$line'" -ForegroundColor Yellow
+
+    $userPairStrings = $line.Split(',')
+    if ($userPairStrings.Count -ne 2) {
+        Write-Warning "Linha '$line' não está no formato esperado 'usuario1,usuario2'. Pulando esta linha."
+        continue # Pula para a próxima linha
     }
 
-    if ($PSBoundParameters.ContainsKey('SearchBase')) {
-        $getUserParams.SearchBase = $SearchBase
-        Write-Host "Pesquisando '$logonNameInput' na OU: $SearchBase..." -ForegroundColor Cyan
-    } else {
-        Write-Host "Pesquisando '$logonNameInput'..." -ForegroundColor Cyan
+    $userInput1 = $userPairStrings[0].Trim()
+    $userInput2 = $userPairStrings[1].Trim()
+
+    if ([string]::IsNullOrWhiteSpace($userInput1) -or [string]::IsNullOrWhiteSpace($userInput2)) {
+        Write-Warning "Linha '$line' contém um nome de usuário vazio após o split e trim. Pulando esta linha."
+        continue
     }
+
+    Write-Host "Par a comparar: [$userInput1] e [$userInput2]"
+
+    # Obter informações do primeiro usuário do par
+    $userInfo1 = Get-ProcessedUserInfo -LogonNameInput $userInput1 -SearchBaseForUser $SearchBase
     
-    try {
-        $adUser = Get-ADUser @getUserParams
-        
-        if ($adUser) {
-            $fullDepartmentFromAD = $adUser.Department # Departamento completo como está no AD
-            $mainDepartmentForComparison = ""
-            $fullDepartmentForDisplay = ""
+    # Obter informações do segundo usuário do par
+    $userInfo2 = Get-ProcessedUserInfo -LogonNameInput $userInput2 -SearchBaseForUser $SearchBase
 
+    # Realizar a comparação se ambos os usuários foram encontrados
+    if ($userInfo1.Found -and $userInfo2.Found) {
+        $comparisonMessage = ""
+        $comparisonColor = "White"
 
-            if ([string]::IsNullOrWhiteSpace($fullDepartmentFromAD)) {
-                $fullDepartmentForDisplay = "Não especificado"
-                $mainDepartmentForComparison = "Não especificado" # Padroniza para comparação
-            } else {
-                $fullDepartmentForDisplay = $fullDepartmentFromAD
-                # Extrai a primeira parte do departamento (antes do primeiro espaço, ou o nome completo se não houver espaço)
-                $mainDepartmentForComparison = ($fullDepartmentFromAD.Split(' ', 2)[0])
-            }
+        Write-Host "  Comparando Departamentos Principais:"
+        Write-Host "    - $($userInfo1.SamAccountName) ('$($userInfo1.MainDepartment)')"
+        Write-Host "    - $($userInfo2.SamAccountName) ('$($userInfo2.MainDepartment)')"
 
-            Write-Host "`n--- Informações do Usuário Encontrado ---" -ForegroundColor Green
-            Write-Host "Entrada Fornecida             : $logonNameInput"
-            Write-Host "Nome de Logon (SamAccountName): $($adUser.SamAccountName)"
-            Write-Host "Nome de Exibição (DisplayName): $($adUser.DisplayName)"
-            Write-Host "Departamento Completo         : $fullDepartmentForDisplay"
-            Write-Host "Departamento Principal (Comp.): $mainDepartmentForComparison" # Mostra o que será comparado
-            Write-Host "DN (DistinguishedName)      : $($adUser.DistinguishedName)"
-
-            # Adiciona informações do usuário encontrado à lista para posterior comparação
-            $foundUsersInfo += [PSCustomObject]@{
-                SamAccountName  = $adUser.SamAccountName
-                DisplayName     = $adUser.DisplayName
-                FullDepartment  = $fullDepartmentForDisplay      # Armazena o departamento completo para exibição
-                MainDepartment  = $mainDepartmentForComparison  # Armazena a parte principal para comparação
-                InputProvided   = $logonNameInput
-            }
+        if ($userInfo1.MainDepartment -eq $userInfo2.MainDepartment) {
+            $comparisonMessage = "PERTENCEM ao MESMO departamento principal ('$($userInfo1.MainDepartment)')"
+            $comparisonColor = "Green"
+        } else {
+            $comparisonMessage = "NÃO PERTENCEM ao mesmo departamento principal ('$($userInfo1.MainDepartment)' vs '$($userInfo2.MainDepartment)')"
+            $comparisonColor = "Red"
         }
-    }
-    catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
-        Write-Error "Usuário com identificador '$logonNameInput' não encontrado no Active Directory."
-        if ($PSBoundParameters.ContainsKey('SearchBase')) {
-            Write-Warning "Verifique se o usuário existe na OU especificada ($SearchBase) ou se o identificador é globalmente único."
-        }
-    }
-    catch {
-        Write-Error "Ocorreu um erro ao buscar o usuário '$logonNameInput': $($_.Exception.Message)"
+        Write-Host "  RESULTADO PARA O PAR: $comparisonMessage" -ForegroundColor $comparisonColor
+    } else {
+        Write-Warning "Não foi possível realizar a comparação para o par da linha '$line', pois um ou ambos os usuários não foram encontrados ou houve erro."
     }
 }
 
-Write-Host "`n--------------------------------------------------"
-Write-Host "Processamento de todos os usuários fornecidos concluído." -ForegroundColor Green
-
-# Validação de Departamento Principal
-if ($foundUsersInfo.Count -eq 0) {
-    Write-Host "`nVALIDAÇÃO DE DEPARTAMENTO PRINCIPAL: Nenhum usuário foi encontrado. Não é possível comparar departamentos." -ForegroundColor Yellow
-} elseif ($foundUsersInfo.Count -eq 1) {
-    Write-Host "`nVALIDAÇÃO DE DEPARTAMENTO PRINCIPAL: Apenas um usuário foi encontrado ($($foundUsersInfo[0].SamAccountName) - Depto. Principal: $($foundUsersInfo[0].MainDepartment)). Não há outros usuários para comparar." -ForegroundColor Yellow
-} else {
-    Write-Host "`n--- VALIDAÇÃO DE DEPARTAMENTO PRINCIPAL (considerando a primeira parte do nome) ---" -ForegroundColor Cyan
-    
-    $firstUserMainDepartment = $foundUsersInfo[0].MainDepartment
-    $allSameMainDepartment = $true # Assume que são iguais até encontrar um diferente
-
-    Write-Host "Comparando os seguintes usuários e departamentos principais:"
-    foreach ($userInfo in $foundUsersInfo) {
-        Write-Host "  - Usuário: $($userInfo.SamAccountName), Depto. Completo: '$($userInfo.FullDepartment)', Depto. Principal (usado na comp.): '$($userInfo.MainDepartment)'"
-        if ($userInfo.MainDepartment -ne $firstUserMainDepartment) {
-            $allSameMainDepartment = $false
-            # Não precisa de 'break' aqui se quiser listar todos, mas a validação já falhou neste ponto para a variável $allSameMainDepartment.
-        }
-    }
-
-    if ($allSameMainDepartment) {
-        Write-Host "`nRESULTADO: Todos os $($foundUsersInfo.Count) usuários encontrados pertencem ao MESMO departamento principal: '$firstUserMainDepartment'." -ForegroundColor Green
-    } else {
-        Write-Host "`nRESULTADO: Os usuários encontrados NÃO pertencem todos ao mesmo departamento principal." -ForegroundColor Red
-        Write-Host "Consulte a lista detalhada acima para ver os departamentos principais de cada um."
-    }
-}
-Write-Host "--------------------------------------------------"
+Write-Host "`n=================================================="
+Write-Host "Processamento do arquivo de pares concluído." -ForegroundColor Green
